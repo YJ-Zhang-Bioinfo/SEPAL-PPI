@@ -2,7 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 一键式多特征工具脚本 (优化版)
-只生成指定特征：HMM相关(6项), s1ssttoken, sasa, secondary_structure
+只生成指定特征 JSON：HMM相关(6项), s1ssttoken, sasa, secondary_structure。
+JSON → multimodal_features.lmdb 由 precompute_multimodal_lmdb.py 负责。
 如果 s1ssttoken 生成失败，自动跳过不中断。
 
 使用方法:
@@ -17,7 +18,6 @@ import argparse
 import subprocess
 import time
 import json
-import re
 from pathlib import Path
 from typing import Optional, Dict, List, Any, Set
 import logging
@@ -214,11 +214,8 @@ def load_enabled_features(config_path: Optional[Path], logger: logging.Logger) -
         return None
 
     try:
-        with open(config_path, 'r', encoding='utf-8') as f:
-            raw = f.read()
-        # 将 ${...} 占位符替换为空字符串，避免 yaml 解析报错
-        raw = re.sub(r'\$\{[^}]+\}', '""', raw)
-        cfg = yaml.safe_load(raw)
+        with config_path.open(encoding='utf-8') as f:
+            cfg = yaml.safe_load(f)
 
         feature_files_cfg = cfg.get('feature_files', {})
         if not isinstance(feature_files_cfg, dict):
@@ -520,7 +517,8 @@ def main():
 
     # 验证与报告
     verification = verify_output_files(output_dir, logger, enabled_features)
-    validate_feature_lengths(fasta_file, output_dir, verification, logger)
+    if fasta_file is not None:
+        validate_feature_lengths(fasta_file, output_dir, verification, logger)
     
     logger.info(f"完成! 总耗时: {time.time() - start_time:.2f}s")
     logger.info(f"输出目录: {output_dir}")

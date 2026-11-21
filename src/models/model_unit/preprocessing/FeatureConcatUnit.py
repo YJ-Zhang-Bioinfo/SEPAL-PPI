@@ -5,12 +5,37 @@ import logging
 from typing import Dict, Any, Optional, List, Union
 from pathlib import Path
 import json
-import numpy as np
+import sys
+import os
+from threading import RLock
+from weakref import WeakValueDictionary
 import lmdb
+import numpy as np
 import yaml
 from Bio import SeqIO
 
 logger = logging.getLogger(__name__)
+
+# Different models in the same process must share a read-only LMDB environment.
+_feature_handles = WeakValueDictionary()
+_feature_handle_lock = RLock()
+
+
+class _FeatureHandle:
+    def __init__(self, path):
+        self.env = lmdb.open(str(path), readonly=True, lock=False, readahead=False,
+                             meminit=False, create=False)
+
+
+def acquire_feature_handle(path):
+    path = path.resolve(strict=True)
+    key = (os.getpid(), path)
+    with _feature_handle_lock:
+        handle = _feature_handles.get(key)
+        if handle is None:
+            handle = _FeatureHandle(path)
+            _feature_handles[key] = handle
+        return handle
 
 
 class ResidualConvBlock(nn.Module):
@@ -41,6 +66,55 @@ class ResidualConvBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
         out = self.block(x)
+        return self.activation(out + residual)
+
+    @staticmethod
+    def _per_protein_batch_norm(x: torch.Tensor, batch_norm: nn.BatchNorm1d) -> torch.Tensor:
+        if not batch_norm.training:
+            return batch_norm(x)
+        if x.shape[-1] <= 1:
+            raise ValueError("Per-protein BatchNorm requires at least two residues")
+
+        mean = x.mean(dim=-1, keepdim=True)
+        variance = x.var(dim=-1, unbiased=False, keepdim=True)
+        normalized = (x - mean) * torch.rsqrt(variance + batch_norm.eps)
+        if batch_norm.affine:
+            normalized = (
+                normalized * batch_norm.weight.view(1, -1, 1)
+                + batch_norm.bias.view(1, -1, 1)
+            )
+
+        if batch_norm.track_running_stats:
+            unbiased_variance = variance.detach().squeeze(-1) * (
+                x.shape[-1] / (x.shape[-1] - 1)
+            )
+            detached_mean = mean.detach().squeeze(-1)
+            with torch.no_grad():
+                for index in range(x.shape[0]):
+                    batch_norm.num_batches_tracked.add_(1)
+                    factor = (
+                        1.0 / float(batch_norm.num_batches_tracked)
+                        if batch_norm.momentum is None
+                        else batch_norm.momentum
+                    )
+                    batch_norm.running_mean.mul_(1.0 - factor).add_(
+                        detached_mean[index], alpha=factor
+                    )
+                    batch_norm.running_var.mul_(1.0 - factor).add_(
+                        unbiased_variance[index], alpha=factor
+                    )
+        return normalized
+
+    def forward_per_protein_batch(self, x: torch.Tensor) -> torch.Tensor:
+        """Vectorize convolutions while retaining per-protein BatchNorm semantics."""
+        residual = x
+        out = self.block[0](x)
+        out = self._per_protein_batch_norm(out, self.block[1])
+        out = self.block[2](out)
+        out = self.block[3](out)
+        out = self.block[4](out)
+        out = self._per_protein_batch_norm(out, self.block[5])
+        out = self.block[6](out)
         return self.activation(out + residual)
 
 
@@ -91,6 +165,13 @@ class FeatureConcatUnit(nn.Module):
         self.handle_missing = self.data_processing_config.get('handle_missing', 'zero')
         self.all_feature_folder = self.data_processing_config.get('all_feature_folder', None)
         self.log_missing_as_error = self.data_processing_config.get('log_missing_as_error', False)
+        self.required_lmdb_schema = self.data_processing_config.get('required_lmdb_schema')
+        self.preserve_per_protein_resnet = bool(
+            self.data_processing_config.get('preserve_per_protein_resnet', False)
+        )
+        self.vectorized_per_protein_resnet = bool(
+            self.data_processing_config.get('vectorized_per_protein_resnet', False)
+        )
 
         self.feature_files = feature_files or {}
         self.feature_configs: Dict[str, Dict[str, Any]] = {}
@@ -215,7 +296,9 @@ class FeatureConcatUnit(nn.Module):
         
         # 【新增】批量加载模式初始化
         self.use_batched_loading = False
+        self.allow_batched_loading = bool(self.data_processing_config.get('use_batched_loading', True))
         self.multimodal_lmdb_env = None
+        self._feature_lmdb_handle = None
         self.lmdb_global_meta = None
         self._init_batched_loading()
         
@@ -498,8 +581,9 @@ class FeatureConcatUnit(nn.Module):
         try:
             fasta_path = Path(self.protein_fasta_path)
             if fasta_path.exists():
-                for record in SeqIO.parse(fasta_path, 'fasta'):
-                    self.protein_lengths[record.id] = len(record.seq)
+                with fasta_path.open('r', encoding='utf-8') as fasta_handle:
+                    for record in SeqIO.parse(fasta_handle, 'fasta'):
+                        self.protein_lengths[record.id] = len(record.seq)
                 logger.info("Loading protein length: %d ", len(self.protein_lengths))
             else:
                 logger.warning("FASTA file does not exist: %s", fasta_path)
@@ -520,29 +604,59 @@ class FeatureConcatUnit(nn.Module):
 
     def _init_batched_loading(self):
         """初始化批量加载模式：自动检测或生成LMDB"""
+        if not self.allow_batched_loading:
+            if self.required_lmdb_schema:
+                raise ValueError('required_lmdb_schema requires use_batched_loading=true')
+            logger.info("Batch multimodal LMDB loading is disabled by configuration")
+            return
         if not self.all_feature_folder:
+            if self.required_lmdb_schema:
+                raise ValueError('A required feature LMDB needs all_feature_folder')
             return
         
         feature_folder = Path(self.all_feature_folder)
         lmdb_path = feature_folder / 'multimodal_features.lmdb'
         
-        # 检查LMDB是否存在
+        if not lmdb_path.exists():
+            try:
+                self._generate_lmdb(lmdb_path)
+            except Exception as exc:
+                if self.required_lmdb_schema:
+                    raise RuntimeError(f'Could not build required feature LMDB {lmdb_path}: {exc}') from exc
+                logger.warning('LMDB generation failed; using sample-wise loading: %s', exc)
+                return
+
+        # Open the new or existing store once; never rebuild an incompatible store implicitly.
         if lmdb_path.exists():
             try:
                 # 尝试打开LMDB
-                self.multimodal_lmdb_env = lmdb.open(
-                    str(lmdb_path), 
-                    readonly=True, 
-                    lock=False,
-                    readahead=False,
-                    meminit=False
-                )
+                self._feature_lmdb_handle = acquire_feature_handle(lmdb_path)
+                self.multimodal_lmdb_env = self._feature_lmdb_handle.env
                 
                 # 读取元数据
                 with self.multimodal_lmdb_env.begin() as txn:
                     meta_bytes = txn.get(b'__global_meta__')
                     if meta_bytes:
                         self.lmdb_global_meta = json.loads(meta_bytes.decode())
+                        if (
+                            self.required_lmdb_schema
+                            and self.lmdb_global_meta.get('schema_version') != self.required_lmdb_schema
+                        ):
+                            raise RuntimeError(
+                                f"Feature LMDB schema mismatch: expected {self.required_lmdb_schema}, "
+                                f"got {self.lmdb_global_meta.get('schema_version')}"
+                            )
+                        if self.lmdb_global_meta.get('feature_order') != self.feature_names_ordered:
+                            raise RuntimeError("Feature LMDB order does not match the configured feature order")
+                        # Token features store one integer ID per residue; their
+                        # learned embedding width is not the LMDB storage width.
+                        expected_dims = [
+                            1 if self.feature_configs[name].get('feature_type') == 'embedding'
+                            else self.feature_input_dims[name]
+                            for name in self.feature_names_ordered
+                        ]
+                        if self.lmdb_global_meta.get('feature_dims') != expected_dims:
+                            raise RuntimeError("Feature LMDB dimensions do not match the configured feature dimensions")
                         self.use_batched_loading = True
                         logger.info(
                             "Enable batch loading mode: %s (feature count=%d, Total Dimension=%d)",
@@ -551,24 +665,24 @@ class FeatureConcatUnit(nn.Module):
                             self.lmdb_global_meta['total_dim']
                         )
                         return
+                    raise RuntimeError("Feature LMDB has no __global_meta__")
             except Exception as e:
-                logger.warning("Failed to open LMDB: %s, Fallback to sample by sample loading", e)
-                if self.multimodal_lmdb_env:
-                    self.multimodal_lmdb_env.close()
-                    self.multimodal_lmdb_env = None
-        
-        # LMDB不存在，尝试自动生成
-        logger.info("Pre computed LMDB of feaute not found: %s", lmdb_path)
-        logger.info("Attempt to automatically generate LMDB (first run)...")
-        
-        try:
-            self._generate_lmdb(lmdb_path)
-            # 生成后重新初始化
-            self._init_batched_loading()
-        except Exception as e:
-            logger.error("Automatic generation of LMDB failed: %s", e)
-            logger.info("Fallback to sample by sample loading mode")
+                if self.required_lmdb_schema:
+                    logger.error("Required audited feature LMDB failed validation: %s", e)
+                else:
+                    logger.warning("Failed to open LMDB: %s, Fallback to sample by sample loading", e)
+                self.close_feature_lmdb()
+                if self.required_lmdb_schema:
+                    raise RuntimeError("Required audited feature LMDB could not be loaded") from e
+        if self.required_lmdb_schema:
+            raise RuntimeError(f"Required audited feature LMDB is unavailable: {lmdb_path}")
     
+    def close_feature_lmdb(self):
+        """Release this model's ownership without closing another model's reader."""
+        self.multimodal_lmdb_env = None
+        self._feature_lmdb_handle = None
+        self.use_batched_loading = False
+
     def _generate_lmdb(self, output_path: Path):
         """自动生成LMDB"""
         from subprocess import run, CalledProcessError
@@ -580,20 +694,25 @@ class FeatureConcatUnit(nn.Module):
         temp_config = {
             'data_processing': {
                 'all_feature_folder': str(self.all_feature_folder),
-                'protein_fasta_path': self.protein_fasta_path
+                'protein_fasta_path': str(self.protein_fasta_path),
+                'required_lmdb_schema': self.required_lmdb_schema,
+                'visible_cap': self.data_processing_config.get('visible_cap'),
             },
-            'feature_files': self.feature_files,
-            'projection': {'early_compression_dim': self.early_compression_dim}
+            'feature_files': {
+                name: {'enabled': True, 'raw_dim': self.feature_input_dims[name],
+                       'file_path': cfg.get('file_path'), 'feature_type': cfg.get('feature_type')}
+                for name, cfg in self.feature_configs.items()
+            },
         }
         
         with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
-            yaml.dump(temp_config, f)
+            yaml.safe_dump(temp_config, f, sort_keys=False)
             temp_config_path = f.name
         
         try:
             # 调用预处理脚本
             cmd = [
-                'python', 'mutifeature_tools/precompute_multimodal_lmdb.py',
+                sys.executable, str(Path(__file__).resolve().parents[4] / 'mutifeature_tools/precompute_multimodal_lmdb.py'),
                 '--config', temp_config_path,
                 '--output', str(output_path),
                 '--map-size', '50'
@@ -627,6 +746,8 @@ class FeatureConcatUnit(nn.Module):
                 # 读取特征
                 feat_bytes = txn.get(protein_id.encode())
                 if feat_bytes is None:
+                    if self.required_lmdb_schema:
+                        raise KeyError(f'Required feature LMDB has no entry for {protein_id}')
                     continue
                 
                 # 读取元数据
@@ -912,7 +1033,7 @@ class FeatureConcatUnit(nn.Module):
         # 原有逐样本加载分支
         fused_list: List[torch.Tensor] = []
         low_dim_inputs: List[torch.Tensor] = []
-        gate_values_for_loss: List[float] = []  # 存储标量，避免保留计算图
+        gate_values_for_loss: List[torch.Tensor] = []
         batch_gate_weights: List[torch.Tensor] = [] # 存储每个样本的门控权重向量 [num_features]
         active_names_for_stats = [name for name in self.feature_names_ordered if name in self.feature_encoders]
 
@@ -960,8 +1081,8 @@ class FeatureConcatUnit(nn.Module):
                 # 通过全局门控层
                 gate_weights = self.feature_gating_layers(global_input)  # [num_features]
 
-                # 记录门控值用于稀疏损失
-                gate_values_for_loss.append(gate_weights.mean().detach().item())
+                # 保留计算图，使稀疏正则能够更新门控参数。
+                gate_values_for_loss.append(gate_weights.mean())
             else:
                 # 退化门控：固定全局标量权重（默认1.0）
                 gate_weights = torch.full(
@@ -1044,9 +1165,8 @@ class FeatureConcatUnit(nn.Module):
         if self.enable_reconstruction and self.training:
             recon = self.reconstruction_head(processed_batch) if self.reconstruction_head else processed_batch
             recon_loss = F.mse_loss(recon, low_dim_batch, reduction='mean')
-            # 使用标量列表计算gate稀疏性损失，避免保留计算图
             if gate_values_for_loss and self.sparsity_loss_weight > 0:
-                gate_penalty = sum(gate_values_for_loss) / len(gate_values_for_loss)
+                gate_penalty = torch.stack(gate_values_for_loss).mean()
                 recon_loss = recon_loss + self.sparsity_loss_weight * gate_penalty
             return enhanced, gate_stats, recon_loss
 
@@ -1062,6 +1182,16 @@ class FeatureConcatUnit(nn.Module):
         
         # 批量加载所有特征 [batch, seq_len, total_dim]
         batch_features = self._load_batch_features_from_lmdb(protein_ids, seq_len, device)
+        if attention_mask is not None:
+            valid_mask = attention_mask[:, :seq_len].to(device=device, dtype=torch.bool)
+        else:
+            lengths = torch.tensor(
+                [min(self.protein_lengths.get(protein_id, seq_len), seq_len) for protein_id in protein_ids],
+                device=device,
+            )
+            valid_mask = torch.arange(seq_len, device=device).unsqueeze(0) < lengths.unsqueeze(1)
+        valid_float = valid_mask.unsqueeze(-1).to(batch_features.dtype)
+        valid_count = valid_float.sum(dim=1, keepdim=True).clamp_min(1.0)
         
         # 分割特征维度
         feature_splits = batch_features.split(self.lmdb_global_meta['feature_dims'], dim=-1)
@@ -1078,6 +1208,16 @@ class FeatureConcatUnit(nn.Module):
             
             cfg = self.feature_configs.get(feature_name, {})
             encoded_dim = cfg.get('_encoded_dim', 8)  # 获取该特征的目标编码维度
+
+            if cfg.get('normalize', False):
+                feature_mean = (feat * valid_float).sum(dim=1, keepdim=True) / valid_count
+                centered = (feat - feature_mean) * valid_float
+                feature_var = centered.square().sum(dim=1, keepdim=True) / valid_count
+                feature_std = torch.sqrt(feature_var)
+                feature_std = torch.where(feature_std < 1e-8, torch.ones_like(feature_std), feature_std)
+                feat = centered / feature_std
+            else:
+                feat = feat * valid_float
             
             # 处理 embedding 特征
             if cfg.get('feature_type') == 'embedding':
@@ -1095,11 +1235,14 @@ class FeatureConcatUnit(nn.Module):
                 
                 # 通过编码器
                 encoder = self.feature_encoders[feature_name]
-                encoded = encoder(embedded)  # [batch, seq_len, encoded_dim]
+                encoded = encoder(embedded, valid_mask)  # [batch, seq_len, encoded_dim]
             else:
                 # 普通特征：直接编码
                 encoder = self.feature_encoders[feature_name]
-                encoded = encoder(feat)  # [batch, seq_len, encoded_dim]
+                encoded = encoder(feat, valid_mask)  # [batch, seq_len, encoded_dim]
+
+            # The sample-wise path encodes only real residues and pads encoded features with zeros.
+            encoded = encoded * valid_float
             
             encoded_list.append(encoded)
             active_names.append(feature_name)
@@ -1114,7 +1257,7 @@ class FeatureConcatUnit(nn.Module):
                     gating_obs = encoded
                 
                 # GAP (Global Average Pooling) -> [batch, early_compression_dim]
-                gating_obs = gating_obs.mean(dim=1)
+                gating_obs = (gating_obs * valid_float).sum(dim=1) / valid_count.squeeze(1)
                 gating_obs_list.append(gating_obs)
         
         if not encoded_list:
@@ -1163,13 +1306,27 @@ class FeatureConcatUnit(nn.Module):
         concatenated = torch.cat(encoded_list, dim=-1)
         
         # LayerNorm
-        fused = self.concat_mlp(concatenated)
+        fused = self.concat_mlp(concatenated) * valid_float
         
         # 低维投影 [batch, seq_len, 128]
         projected = self.feature_projection(fused)
         
         # ResNet [batch, seq_len, 128]
-        if not isinstance(self.resnet_blocks, nn.Identity):
+        if (
+            not isinstance(self.resnet_blocks, nn.Identity)
+            and self.preserve_per_protein_resnet
+            and self.vectorized_per_protein_resnet
+        ):
+            processed = projected.transpose(1, 2)
+            for block in self.resnet_blocks:
+                processed = block.forward_per_protein_batch(processed)
+            processed = processed.transpose(1, 2)
+        elif not isinstance(self.resnet_blocks, nn.Identity) and self.preserve_per_protein_resnet:
+            processed = torch.stack(
+                [self._run_resnet(projected[index:index + 1]).squeeze(0) for index in range(batch_size)],
+                dim=0,
+            )
+        elif not isinstance(self.resnet_blocks, nn.Identity):
             processed = projected.transpose(1, 2)  # [batch, 128, seq_len]
             for block in self.resnet_blocks:
                 processed = block(processed)
@@ -1192,6 +1349,8 @@ class FeatureConcatUnit(nn.Module):
         if self.enable_reconstruction and self.training:
             recon = self.reconstruction_head(processed) if self.reconstruction_head else processed
             recon_loss = F.mse_loss(recon, projected, reduction='mean')
+            if self.gating_enabled and gate_weights is not None and self.sparsity_loss_weight > 0:
+                recon_loss = recon_loss + self.sparsity_loss_weight * gate_weights.mean()
             return enhanced, gate_stats, recon_loss
         
         return enhanced
@@ -1244,6 +1403,14 @@ class LightweightFeatureEncoder(nn.Module):
         # 线性投影
         x = self.project(feature_seq)  # [..., seq_len, output_dim]
         x = self.norm(x)
+        mask = None
+        if attention_mask is not None:
+            mask = attention_mask.to(device=x.device, dtype=x.dtype)
+            if x.dim() == 3 and mask.dim() == 2:
+                mask = mask.unsqueeze(-1)
+            elif x.dim() == 2 and mask.dim() == 1:
+                mask = mask.unsqueeze(-1)
+            x = x * mask
         
         # 1D-CNN 需要 [batch, channels, length] 格式
         is_batched = x.dim() == 3
@@ -1253,6 +1420,8 @@ class LightweightFeatureEncoder(nn.Module):
         x = x.transpose(1, 2)  # [batch, output_dim, seq_len]
         x = self.conv(x)       # [batch, output_dim, seq_len]
         x = x.transpose(1, 2)  # [batch, seq_len, output_dim]
+        if mask is not None:
+            x = x * mask
         
         if not is_batched:
             x = x.squeeze(0)   # [seq_len, output_dim]

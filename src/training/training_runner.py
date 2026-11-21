@@ -81,6 +81,34 @@ def _extract_interaction_type_from_config(model_config: Dict[str, Any]) -> str:
     return "hadamard"
 
 
+def _build_loader_test_files(data_config: Dict[str, Any], include_final: bool) -> Dict[str, str]:
+    """Build datasets a loader may open while leaving deferred final sets inert."""
+    test_files: Dict[str, str] = {}
+    configured = data_config.get("test_files", {})
+    if isinstance(configured, dict):
+        for name, path in configured.items():
+            if not isinstance(path, str) or not path:
+                continue
+            if not include_final and str(name).lower() in {"c3", "test", "final"}:
+                continue
+            test_files[str(name)] = path
+
+    validation_file = data_config.get("validation_file")
+    if isinstance(validation_file, str) and validation_file:
+        test_files.setdefault("c2", validation_file)
+
+    if include_final:
+        final_file = data_config.get("final_test_file") or data_config.get("test_file")
+        if isinstance(final_file, str) and final_file:
+            test_files.setdefault("c3", final_file)
+
+    return test_files
+
+
+def _defer_c3(config: Dict[str, Any]) -> bool:
+    return bool(config.get("protocol", {}).get("defer_c3_until_final", False))
+
+
 def _check_bucketed_lmdb(lmdb_path: str, logger) -> bool:
     """Robustly verify if an LMDB is bucketed; permissive on uncertainty.
 
@@ -181,7 +209,7 @@ class ModelManager:
         self.logger = logger
         self.best_model_path = self.output_dir / "best_model.pth"
         self.last_model_path = self.output_dir / "last_model.pth"
-        self.best_metric = 0.0
+        self.best_metric = -math.inf
         self.best_epoch = 1
         self.inference_config_path = self.output_dir / "inference_config.yaml"
 
@@ -199,6 +227,8 @@ class ModelManager:
 
     def save_best_model(self, model, epoch: int, metric_value: float,
                         training_config: Dict, model_config: Dict) -> bool:
+        if not math.isfinite(metric_value):
+            raise ValueError("Cannot select a checkpoint from a nonfinite C2 metric")
         if metric_value > self.best_metric:
             self.best_metric = metric_value
             self.best_epoch = epoch
@@ -315,14 +345,7 @@ class ModelManager:
             inference_batch_size = original_config.get("training", {}).get("batch_size", 32)
 
         data_config = dict(original_config.get("data", {}))
-        test_files: Dict[str, str] = {}
-        val_file = data_config.get("validation_file")
-        if isinstance(val_file, str) and val_file:
-            test_files["c2"] = val_file
-        test_file = data_config.get("test_file")
-        if isinstance(test_file, str) and test_file:
-            test_files["c3"] = test_file
-        data_config["test_files"] = test_files
+        data_config["test_files"] = _build_loader_test_files(data_config, include_final=False)
 
         inference_config = {
             "mode": "inference",
@@ -368,14 +391,9 @@ class ModelManager:
             inference_batch_size = original_config.get("training", {}).get("batch_size", 32)
 
         data_config = dict(original_config.get("data", {}))
-        test_files: Dict[str, str] = {}
-        val_file = data_config.get("validation_file")
-        if isinstance(val_file, str) and val_file:
-            test_files["c2"] = val_file
-        test_file = data_config.get("test_file")
-        if isinstance(test_file, str) and test_file:
-            test_files["c3"] = test_file
-        data_config["test_files"] = test_files
+        data_config["test_files"] = _build_loader_test_files(
+            data_config, include_final=not _defer_c3(original_config)
+        )
 
         best_inference_config = {
             "mode": "inference",
@@ -515,9 +533,33 @@ def _load_pretrained_weights(model: nn.Module, checkpoint_path: str, logger=None
 
 
 # ---------------------------- validation helpers ----------------------------
+def _check_c2_results(result, dataset):
+    """Require the complete ordered C2 rows, including original multiplicities."""
+    n = len(dataset)
+    if not result or n == 0 or result.get("n_samples") != n:
+        raise RuntimeError("C2 validation did not return every source row")
+    for name in ("pr_auc", "roc_auc"):
+        value = result.get(name)
+        if value is None or not math.isfinite(value) or not 0 <= value <= 1:
+            raise RuntimeError(f"C2 validation returned invalid {name}: {value}")
+    predictions = np.asarray(result["predictions"]).reshape(-1)
+    labels = np.asarray(result["true_labels"]).reshape(-1)
+    pairs = result.get("protein_ids")
+    if len(predictions) != n or len(labels) != n or pairs is None or len(pairs) != n:
+        raise RuntimeError("C2 prediction/label/endpoint counts are inconsistent")
+    if not np.isfinite(predictions).all() or not ((predictions >= 0) & (predictions <= 1)).all():
+        raise RuntimeError("C2 probabilities are not finite values in [0,1]")
+    expected = getattr(dataset, "interaction_pairs", None)
+    if expected is not None:
+        actual = [(str(a), str(b), int(y)) for (a, b), y in zip(pairs, labels)]
+        if actual != [(str(a), str(b), int(y)) for a, b, y in expected]:
+            raise RuntimeError("C2 endpoints, labels or source row order changed")
+
+
 def run_epoch_validation(model_path: str, inference_config_path: str,
                          data_loaders: Dict, device, logger) -> Tuple[Dict, Dict]:
-    """Run epoch-time validation on c2/c3 datasets using InferenceEngine."""
+    """Run epoch-time validation on C2 only; C3 is reserved for final evaluation."""
+    inference_engine = None
     try:
         with open(inference_config_path, "r", encoding="utf-8") as f:
             inference_config = yaml.safe_load(f)
@@ -526,12 +568,8 @@ def run_epoch_validation(model_path: str, inference_config_path: str,
         inference_engine.load_model(model_path, device=device)
 
         val_datasets = {}
-        test_datasets = {}
-
         if "c2" in data_loaders and hasattr(data_loaders["c2"], "dataset"):
             val_datasets["c2"] = data_loaders["c2"].dataset
-        if "c3" in data_loaders and hasattr(data_loaders["c3"], "dataset"):
-            test_datasets["c3"] = data_loaders["c3"].dataset
 
         # Fallback: scan for keys ending with _dataset
         for key, loader in data_loaders.items():
@@ -539,35 +577,34 @@ def run_epoch_validation(model_path: str, inference_config_path: str,
                 name = key[:-8]
                 if name == "c2" and "c2" not in val_datasets:
                     val_datasets["c2"] = loader.dataset
-                if name == "c3" and "c3" not in test_datasets:
-                    test_datasets["c3"] = loader.dataset
 
         logger.debug(f"Found validation datasets: {list(val_datasets.keys())}")
-        logger.debug(f"Found test datasets: {list(test_datasets.keys())}")
 
         val_metrics: Dict[str, Any] = {}
-        test_metrics: Dict[str, Any] = {}
 
         if val_datasets:
             val_results = inference_engine.evaluate_datasets(val_datasets, show_progress=True, save_results=False)
             if val_results and "c2" in val_results:
                 val_metrics = val_results["c2"]
 
-        if test_datasets:
-            test_results = inference_engine.evaluate_datasets(test_datasets, show_progress=True, save_results=False)
-            if test_results and "c3" in test_results:
-                test_metrics = test_results["c3"]
-
-        return val_metrics, test_metrics
+        if "c2" not in val_datasets:
+            raise RuntimeError("No C2 validation dataset is available")
+        _check_c2_results(val_metrics, val_datasets["c2"])
+        return val_metrics, {}
     except Exception as e:
         logger.error(f"Epoch validation failed: {e}")
         logger.error(f"Traceback: {traceback.format_exc()}")
-        return {}, {}
+        raise RuntimeError("C2 validation failed; checkpoint selection aborted") from e
+    finally:
+        if inference_engine is not None:
+            inference_engine.close()
 
 
 def run_final_evaluation(model_path: str, inference_config_path: str,
-                         data_loaders: Dict, output_dir: str, device, logger) -> Dict:
+                          data_loaders: Dict, output_dir: str, device, logger,
+                          include_c3: bool = True) -> Dict:
     """Run final evaluation with the best model and persist results if requested."""
+    inference_engine = None
     try:
         with open(inference_config_path, "r", encoding="utf-8") as f:
             inference_config = yaml.safe_load(f)
@@ -579,12 +616,15 @@ def run_final_evaluation(model_path: str, inference_config_path: str,
         eval_datasets = {}
         if "c2" in data_loaders and hasattr(data_loaders["c2"], "dataset"):
             eval_datasets["c2"] = data_loaders["c2"].dataset
-        if "c3" in data_loaders and hasattr(data_loaders["c3"], "dataset"):
+        if include_c3 and "c3" in data_loaders and hasattr(data_loaders["c3"], "dataset"):
             eval_datasets["c3"] = data_loaders["c3"].dataset
 
         results = inference_engine.evaluate_datasets(
             eval_datasets, show_progress=True, save_results=True
         ) if eval_datasets else {}
+        if "c2" not in eval_datasets:
+            raise RuntimeError("No C2 dataset available for final evaluation")
+        _check_c2_results(results.get("c2"), eval_datasets["c2"])
 
         # 导出门控统计 CSV（c2/c3 同表）
         try:
@@ -694,7 +734,10 @@ def run_final_evaluation(model_path: str, inference_config_path: str,
     except Exception as e:
         logger.error(f"Final evaluation failed: {e}")
         logger.error(f"Traceback: {traceback.format_exc()}")
-        return {}
+        raise RuntimeError("Final C2 evaluation failed") from e
+    finally:
+        if inference_engine is not None:
+            inference_engine.close()
 
 
 def _collect_epoch_head_stats(model, data_loader, device, logger, max_batches: int = 0) -> Dict[str, Any]:
@@ -905,6 +948,7 @@ def run_training_mode(config: Dict[str, Any], output_dir: str, logger) -> Dict[s
     model_config = config["model"]
     training_config = config["training"]
     data_config = config["data"]
+    loader_test_files = _build_loader_test_files(data_config, include_final=not _defer_c3(config))
 
     target_precision = data_config.get("target_precision", "fp32")
 
@@ -962,12 +1006,13 @@ def run_training_mode(config: Dict[str, Any], output_dir: str, logger) -> Dict[s
                 cis_config = {
                     "embedding_file": embedding_file,
                     "train_file": data_config["train_file"],
-                    "test_files": {"c2": data_config["validation_file"], "c3": data_config["test_file"]},
+                    "test_files": loader_test_files,
                     "batch_size": training_config["batch_size"],
                     "cache_size": data_config.get("cache_size", 8000),
                     # 以数据源embedding维度解析LMDB
                     "embedding_dim": data_config["embedding_dim"],
                     "target_precision": data_config.get("target_precision", "fp32"),
+                    "train_drop_last": data_config.get("train_drop_last", False),
                     "seed": seed,
                 }
 
@@ -992,7 +1037,7 @@ def run_training_mode(config: Dict[str, Any], output_dir: str, logger) -> Dict[s
                 compat_config = {
                     "embedding_file": embedding_file,
                     "train_file": data_config["train_file"],
-                    "test_files": {"c2": data_config["validation_file"], "c3": data_config["test_file"]},
+                    "test_files": loader_test_files,
                     "fasta_file": data_config["fasta_file"],
                     "batch_size": training_config["batch_size"],
                     "cache_size": data_config.get("cache_size", 8000),
@@ -1002,6 +1047,8 @@ def run_training_mode(config: Dict[str, Any], output_dir: str, logger) -> Dict[s
                     "pooling_type": _extract_pooling_type_from_config(model_config),
                     "target_precision": data_config.get("target_precision"),
                     "cis_type": data_config.get("cis_type", False),
+                    "train_drop_last": data_config.get("train_drop_last", False),
+                    "bucket_tolerance": data_config.get("bucket_tolerance", 0),
                     "seed": seed,
                 }
 
@@ -1036,27 +1083,13 @@ def run_training_mode(config: Dict[str, Any], output_dir: str, logger) -> Dict[s
                     else:
                         dataset_info["train"] = {"n_samples": "Unknown"}
 
-                test_files = data_config.get("test_files", {})
-                if isinstance(test_files, dict) and test_files:
-                    for test_name, test_file in test_files.items():
-                        if test_file and Path(test_file).exists():
-                            with open(test_file, "r") as f:
-                                test_count = sum(1 for line in f if line.strip())
-                            dataset_info[test_name] = {"n_samples": test_count}
-                        else:
-                            dataset_info[test_name] = {"n_samples": "Unknown"}
-                else:
-                    val_file = data_config.get("validation_file")
-                    if val_file and Path(val_file).exists():
-                        with open(val_file, "r") as f:
-                            val_count = sum(1 for line in f if line.strip())
-                        dataset_info["c2"] = {"n_samples": val_count}
-
-                    test_file = data_config.get("test_file")
+                for test_name, test_file in loader_test_files.items():
                     if test_file and Path(test_file).exists():
                         with open(test_file, "r") as f:
                             test_count = sum(1 for line in f if line.strip())
-                        dataset_info["c3"] = {"n_samples": test_count}
+                        dataset_info[test_name] = {"n_samples": test_count}
+                    else:
+                        dataset_info[test_name] = {"n_samples": "Unknown"}
             except Exception as e:
                 if hasattr(logger, "warning"):
                     logger.warning(f"Unable to get dataset statistics: {e}")
@@ -1132,6 +1165,7 @@ def run_training_mode(config: Dict[str, Any], output_dir: str, logger) -> Dict[s
             output_dir,
             device,
             logger,
+            include_c3=not _defer_c3(config),
         )
 
         # Step 6: Persist best config
@@ -1271,6 +1305,7 @@ def run_fusion_finetune_mode(config: Dict[str, Any], output_dir: str, logger) ->
     model_config = config["model"]
     training_config = config["training"]
     data_config = config["data"]
+    loader_test_files = _build_loader_test_files(data_config, include_final=not _defer_c3(config))
 
     target_precision = data_config.get("target_precision", "fp32")
     log_config = {
@@ -1304,12 +1339,13 @@ def run_fusion_finetune_mode(config: Dict[str, Any], output_dir: str, logger) ->
             cis_config = {
                 "embedding_file": embedding_file,
                 "train_file": data_config["train_file"],
-                "test_files": {"c2": data_config["validation_file"], "c3": data_config["test_file"]},
+                "test_files": loader_test_files,
                 "batch_size": training_config["batch_size"],
                 "cache_size": data_config.get("cache_size", 8000),
                 # 使用数据源的嵌入维度来解析LMDB
                 "embedding_dim": data_config["embedding_dim"],
                 "target_precision": data_config.get("target_precision", "fp32"),
+                "train_drop_last": data_config.get("train_drop_last", False),
                 "seed": seed,
             }
 
@@ -1321,7 +1357,7 @@ def run_fusion_finetune_mode(config: Dict[str, Any], output_dir: str, logger) ->
             compat_config = {
                 "embedding_file": embedding_file,
                 "train_file": data_config["train_file"],
-                "test_files": {"c2": data_config["validation_file"], "c3": data_config["test_file"]},
+                "test_files": loader_test_files,
                 "fasta_file": data_config["fasta_file"],
                 "batch_size": training_config["batch_size"],
                 "cache_size": data_config.get("cache_size", 8000),
@@ -1331,6 +1367,8 @@ def run_fusion_finetune_mode(config: Dict[str, Any], output_dir: str, logger) ->
                 "pooling_type": _extract_pooling_type_from_config(model_config),
                 "target_precision": data_config.get("target_precision"),
                 "cis_type": data_config.get("cis_type", False),
+                "train_drop_last": data_config.get("train_drop_last", False),
+                "bucket_tolerance": data_config.get("bucket_tolerance", 0),
                 "seed": seed,
             }
 
@@ -1386,6 +1424,7 @@ def run_fusion_finetune_mode(config: Dict[str, Any], output_dir: str, logger) ->
         output_dir,
         device,
         logger,
+        include_c3=not _defer_c3(config),
     )
 
     # ---- 导出最佳模型的门控报告（若预处理支持） ----
@@ -1591,6 +1630,20 @@ def train_sequence_model_with_validation(
 
     epochs = training_config["epochs"]
     verbose = config["logging"]["verbose"]
+    audit_epoch_coverage = bool(config.get("protocol", {}).get("audit_epoch_coverage", False))
+    train_dataset = getattr(data_loaders["train"], "dataset", data_loaders["train"])
+    expected_train_rows = len(train_dataset)
+    expected_train_pairs = None
+    if audit_epoch_coverage:
+        interaction_pairs = getattr(train_dataset, "interaction_pairs", None)
+        if interaction_pairs is None:
+            raise ValueError("protocol.audit_epoch_coverage requires dataset.interaction_pairs")
+        expected_train_pairs = {
+            (str(protein1), str(protein2), int(label))
+            for protein1, protein2, label in interaction_pairs
+        }
+        if len(expected_train_pairs) != expected_train_rows:
+            raise ValueError("training dataset contains duplicate ordered pair/label rows")
     logger.info(f"Starting training ({epochs} epochs)")
 
     epoch_losses = []
@@ -1602,6 +1655,9 @@ def train_sequence_model_with_validation(
         model.train()
         total_loss = 0.0
         num_batches = 0
+        samples_seen = 0
+        seen_train_pairs = set()
+        duplicate_train_rows = 0
 
         train_pbar = tqdm(
             data_loaders["train"], desc=f"Epoch {epoch + 1}/{epochs}", leave=False, disable=not verbose
@@ -1633,16 +1689,33 @@ def train_sequence_model_with_validation(
                 protein1_seq, protein2_seq, protein1_mask, protein2_mask, protein_ids
             )
 
-            if isinstance(criterion, nn.BCEWithLogitsLoss):
-                loss = criterion(predictions.squeeze(), labels)
-            else:
-                loss = criterion(predictions.squeeze(), labels)
+            prediction_vector = predictions.reshape(-1)
+            label_vector = labels.reshape(-1)
+            samples_seen += int(label_vector.numel())
+            if audit_epoch_coverage:
+                batch_pairs = batch.get("protein_ids")
+                if batch_pairs is None or len(batch_pairs) != label_vector.numel():
+                    raise ValueError("epoch coverage audit requires one protein_ids entry per label")
+                batch_labels = label_vector.detach().cpu().tolist()
+                for pair, label in zip(batch_pairs, batch_labels):
+                    key = (str(pair[0]), str(pair[1]), int(round(float(label))))
+                    if key in seen_train_pairs:
+                        duplicate_train_rows += 1
+                    seen_train_pairs.add(key)
+            loss = criterion(prediction_vector, label_vector)
 
             # head-gating 熵正则（若模型支持）
             if hasattr(model, "get_head_entropy_regularization_loss"):
                 gate_entropy_loss = model.get_head_entropy_regularization_loss()
                 if gate_entropy_loss is not None:
                     loss = loss + gate_entropy_loss
+
+            reconstruction_loss = getattr(model, "_reconstruction_loss", None)
+            if reconstruction_loss is not None:
+                if torch.is_tensor(reconstruction_loss):
+                    loss = loss + reconstruction_loss
+                elif reconstruction_loss:
+                    loss = loss + float(reconstruction_loss)
 
             if ga_enabled:
                 loss = loss / ga_steps
@@ -1672,7 +1745,44 @@ def train_sequence_model_with_validation(
                 current_lr = optimizer.param_groups[0]["lr"]
             train_pbar.set_postfix({"loss": f"{current_loss:.4f}", "lr": f"{current_lr:.6f}"})
 
+        # Do not discard the final incomplete gradient-accumulation group.
+        if ga_enabled and accumulation_count > 0:
+            correction = ga_steps / accumulation_count
+            for parameter in model.parameters():
+                if parameter.grad is not None:
+                    parameter.grad.mul_(correction)
+            if gc_enabled:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            optimizer.step()
+            optimizer.zero_grad()
+
         train_pbar.close()
+
+        coverage_audit = {
+            "expected_samples": expected_train_rows,
+            "samples_seen": samples_seen,
+            "unique_ordered_pair_label_rows": len(seen_train_pairs) if audit_epoch_coverage else None,
+            "duplicate_rows": duplicate_train_rows if audit_epoch_coverage else None,
+            "missing_rows": (
+                len(expected_train_pairs - seen_train_pairs)
+                if audit_epoch_coverage and expected_train_pairs is not None
+                else None
+            ),
+            "unexpected_rows": (
+                len(seen_train_pairs - expected_train_pairs)
+                if audit_epoch_coverage and expected_train_pairs is not None
+                else None
+            ),
+        }
+        if audit_epoch_coverage:
+            if (
+                samples_seen != expected_train_rows
+                or duplicate_train_rows
+                or coverage_audit["missing_rows"]
+                or coverage_audit["unexpected_rows"]
+            ):
+                raise RuntimeError(f"epoch coverage audit failed: {coverage_audit}")
+            logger.info(f"Epoch {epoch + 1} coverage audit passed: {coverage_audit}")
 
         epoch_loss = total_loss / max(num_batches, 1)
         epoch_losses.append(epoch_loss)
@@ -1687,7 +1797,7 @@ def train_sequence_model_with_validation(
             model_manager.get_last_model_path(), model_manager.get_inference_config_path(), data_loaders, device, logger
         )
 
-        current_val_metric = val_metrics.get("pr_auc", 0.0)
+        current_val_metric = val_metrics["pr_auc"]
         is_best = model_manager.save_best_model(
             model, epoch + 1, current_val_metric, training_config, config["model"]
         )
@@ -1703,10 +1813,6 @@ def train_sequence_model_with_validation(
                 logger.warning(f"LR scheduler step failed: {_e}")
             current_lr = optimizer.param_groups[0]["lr"]
             logger.debug(f"Epoch {epoch + 1} LR: {current_lr:.6f}")
-
-        if epoch == 0 and not Path(model_manager.get_best_model_path()).exists():
-            logger.warning("First epoch validation failed; using training model as initial best model")
-            model_manager.save_best_model(model, epoch + 1, 0.0, training_config, config["model"])
 
         epoch_time = time.time() - epoch_start
         if scheduler is not None and hasattr(scheduler, "get_last_lr"):
@@ -1740,6 +1846,7 @@ def train_sequence_model_with_validation(
             "epoch_time": epoch_time,
             "learning_rate": current_lr,
             "is_best": is_best,
+            "coverage_audit": coverage_audit,
         }
         epoch_results.append(current_epoch_result)
 

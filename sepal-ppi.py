@@ -700,6 +700,7 @@ def main():
             logger.info(f"Compute device: {device}")
             
             # 处理配置文件参数
+            evaluate_final = True
             if args.ensemble_config:
                 # 从集成配置文件读取参数
                 import yaml
@@ -721,6 +722,8 @@ def main():
                     args.train_model = config_data['train_model']
                 if 'debug' in config_data:
                     args.debug = config_data['debug']
+                if 'evaluate_final' in config_data:
+                    evaluate_final = bool(config_data['evaluate_final'])
                 
                 # 保存超参数配置
                 model_params = {}
@@ -780,7 +783,8 @@ def main():
                 seed=args.seed,
                 mode=args.ensemble_mode,
                 train_model=args.train_model,
-                model_params=model_params
+                model_params=model_params,
+                evaluate_final=evaluate_final,
             )
             
             logger.info("SEPAL-PPI ensemble training finished!")

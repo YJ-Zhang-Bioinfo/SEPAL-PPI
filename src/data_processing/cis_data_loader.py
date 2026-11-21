@@ -482,7 +482,7 @@ def create_cis_data_loaders(config: Dict[str, Any]) -> Dict[str, Any]:
             collate_fn=cis_collate_fn,
             num_workers=0,  # CIS数据已在GPU缓存中，不需要多进程
             pin_memory=False,  # 数据已在GPU上
-            drop_last=True,
+            drop_last=config.get('train_drop_last', False),
             generator=create_generator(config.get('seed', 42))
         )
         
@@ -533,4 +533,4 @@ def create_cis_data_loaders(config: Dict[str, Any]) -> Dict[str, Any]:
         'cache_stats': cache_stats,
         'pooling_type': 'avg',  # CIS数据使用简单平均
         'is_cis_data': True
-    } 
+    }

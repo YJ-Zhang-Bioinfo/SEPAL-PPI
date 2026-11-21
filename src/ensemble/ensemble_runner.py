@@ -327,6 +327,7 @@ def run_ensemble_training_mode(
     mode: str = "logits",
     train_model: str = "linear",
     model_params: Dict[str, Any] | None = None,
+    evaluate_final: bool = True,
 ) -> Dict[str, Any]:
     """Run ensemble training mode."""
     from src.ensemble.ensemble_engine import EnsembleInferenceEngine
@@ -346,6 +347,7 @@ def run_ensemble_training_mode(
         "mode": mode,
         "train_model": train_model,
         "model_params": model_params or {},
+        "evaluate_final": evaluate_final,
         "output_dir": str(output_path),
     }
 
@@ -363,14 +365,23 @@ def run_ensemble_training_mode(
         logger.info("Ensemble inference engine will automatically handle data loading...")
         logger.info(f"Starting ensemble training (mode={mode}, model={train_model})...")
 
-        # Collect features or logits
-        all_data = ensemble_engine.collect_logits(mode=mode)
+        # Fit ensemble weights on C2/validation only.
+        selection_data = ensemble_engine.collect_logits(mode=mode, dataset_names=["c2", "val"])
+        if not any(name in selection_data for name in ("c2", "val")):
+            raise ValueError("Ensemble training requires a C2/validation dataset")
 
         # Train meta-learner
-        ensemble_engine.train_meta_learner(all_data, mode=mode, model_type=train_model)
+        ensemble_engine.train_meta_learner(selection_data, mode=mode, model_type=train_model)
 
-        # Ensemble prediction
-        ensemble_results = ensemble_engine.ensemble_predict(all_data, mode=mode)
+        selection_results = ensemble_engine.ensemble_predict(selection_data, mode=mode)
+        final_results = {}
+        if evaluate_final:
+            # Keep reporting all configured splits, including custom names, after fitting.
+            final_data = ensemble_engine.collect_logits(mode=mode, exclude_names=("c2", "val"))
+            final_results = ensemble_engine.ensemble_predict(final_data, mode=mode) if final_data else {}
+        else:
+            logger.info("Final datasets are deferred; ensemble training opened C2/validation only")
+        ensemble_results = {**selection_results, **final_results}
 
         results = {
             "ensemble_results": ensemble_results,

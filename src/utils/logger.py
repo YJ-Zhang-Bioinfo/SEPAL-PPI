@@ -110,18 +110,23 @@ class SEPALLogger:
         """Log epoch results in a structured format"""
         val_auc = val_metrics.get('roc_auc', 0.0)
         val_ap = val_metrics.get('pr_auc', 0.0)
-        test_auc = test_metrics.get('roc_auc', 0.0)
-        test_ap = test_metrics.get('pr_auc', 0.0)
-        
-        message = (f"Ep {epoch} | "
-                  f"Val-AUC:{val_auc:.3f} | "
-                  f"Val-AP:{val_ap:.3f} | "
-                  f"Tes-AUC:{test_auc:.3f} | "
-                  f"Tes-AP:{test_ap:.3f} | "
-                  f"TrLoss:{train_loss:.3f} | "
-                  f"LR:{learning_rate:.6f} | "
-                  f"Best@Ep{best_epoch}:{best_metric:.3f} | "
-                  f"Time:{epoch_time:.1f}s")
+        parts = [
+            f"Ep {epoch}",
+            f"Val-AUC:{val_auc:.3f}",
+            f"Val-AP:{val_ap:.3f}",
+        ]
+        if test_metrics:
+            parts.extend([
+                f"Test-AUC:{test_metrics.get('roc_auc', 0.0):.3f}",
+                f"Test-AP:{test_metrics.get('pr_auc', 0.0):.3f}",
+            ])
+        parts.extend([
+            f"TrLoss:{train_loss:.3f}",
+            f"LR:{learning_rate:.6f}",
+            f"Best@Ep{best_epoch}:{best_metric:.3f}",
+            f"Time:{epoch_time:.1f}s",
+        ])
+        message = " | ".join(parts)
         
         self.info(message)
     

@@ -534,7 +534,11 @@ class LengthSortedBatchSampler(Sampler):
 
 class SmartBucketBatchSampler(Sampler):
     """
-    智能桶感知批次采样器 - 优先选择相似桶长度的样本组成批次
+    桶感知批次采样器，每个样本在每个 epoch 中至多分配一次。
+
+    ``bucket_tolerance`` 仅为旧调用保留。旧实现先生成单桶批次，再为相邻
+    桶生成额外混合批次，导致同一样本被重复训练；当前实现不再生成这些
+    重复批次。
     """
     
     def __init__(self, dataset, batch_size: int, embedding_cache: UnifiedEmbeddingCache,
@@ -582,37 +586,18 @@ class SmartBucketBatchSampler(Sampler):
     
     def __iter__(self):
         """生成批次索引"""
-        # 收集所有桶的批次
         all_batches = []
-        
-        for bucket_id, indices in self.bucket_indices.items():
+
+        for bucket_id in sorted(self.bucket_indices):
+            indices = list(self.bucket_indices[bucket_id])
             if self.shuffle:
                 random.shuffle(indices)
-            
+
             # 为当前桶生成批次
             for i in range(0, len(indices), self.batch_size):
                 batch = indices[i:i + self.batch_size]
                 if len(batch) == self.batch_size or not self.drop_last:
                     all_batches.append(batch)
-            
-            # 考虑桶容差，与相邻桶混合批次
-            if self.bucket_tolerance > 0:
-                for tolerance in range(1, self.bucket_tolerance + 1):
-                    adjacent_bucket = bucket_id + tolerance
-                    if adjacent_bucket in self.bucket_indices:
-                        adjacent_indices = self.bucket_indices[adjacent_bucket]
-                        if self.shuffle:
-                            random.shuffle(adjacent_indices)
-                        
-                        # 创建混合批次
-                        mixed_indices = indices + adjacent_indices
-                        if self.shuffle:
-                            random.shuffle(mixed_indices)
-                        
-                        for i in range(0, len(mixed_indices), self.batch_size):
-                            batch = mixed_indices[i:i + self.batch_size]
-                            if len(batch) == self.batch_size or not self.drop_last:
-                                all_batches.append(batch)
         
         # 打乱所有批次的顺序
         if self.shuffle:
@@ -624,25 +609,12 @@ class SmartBucketBatchSampler(Sampler):
     def __len__(self):
         """计算总批次数"""
         total_batches = 0
-        for bucket_id, indices in self.bucket_indices.items():
+        for indices in self.bucket_indices.values():
             # 计算当前桶的批次数量
             if self.drop_last:
                 total_batches += len(indices) // self.batch_size
             else:
                 total_batches += (len(indices) + self.batch_size - 1) // self.batch_size
-            
-            # 考虑桶容差，计算混合批次数量
-            if self.bucket_tolerance > 0:
-                for tolerance in range(1, self.bucket_tolerance + 1):
-                    adjacent_bucket = bucket_id + tolerance
-                    if adjacent_bucket in self.bucket_indices:
-                        adjacent_indices = self.bucket_indices[adjacent_bucket]
-                        mixed_indices = indices + adjacent_indices
-                        
-                        if self.drop_last:
-                            total_batches += len(mixed_indices) // self.batch_size
-                        else:
-                            total_batches += (len(mixed_indices) + self.batch_size - 1) // self.batch_size
         return total_batches
 
 
@@ -956,8 +928,8 @@ def create_smart_batch_data_loaders(config: Dict[str, Any]) -> Dict[str, Any]:
             batch_size=batch_size,
             embedding_cache=embedding_cache,
             shuffle=True,
-            drop_last=True,
-            bucket_tolerance=1
+            drop_last=config.get('train_drop_last', False),
+            bucket_tolerance=config.get('bucket_tolerance', 0)
         )
         
         train_loader = DataLoader(

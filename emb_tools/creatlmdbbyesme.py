@@ -284,7 +284,7 @@ def run_bucketization(
         if result.returncode == 0:
             print("[bucket] Bucketization completed.")
     except subprocess.CalledProcessError as e:
-        print(f"[bucket] Bucketization failed with return code {e.returncode}")
+        raise RuntimeError(f"Bucketization failed with return code {e.returncode}") from e
 
 def read_fasta_sequences(fasta_file_path):
     """Read FASTA file and return a dict {seq_id: sequence}"""

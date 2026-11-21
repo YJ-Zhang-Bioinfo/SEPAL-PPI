@@ -31,6 +31,15 @@ class InferenceEngine:
         self.logger = logger
         self.device: Optional[torch.device] = None
         self.model: Optional[torch.nn.Module] = None
+        self._owns_model = False
+
+    def close(self):
+        if self._owns_model and self.model is not None:
+            for module in self.model.modules():
+                if hasattr(module, 'close_feature_lmdb'):
+                    module.close_feature_lmdb()
+        self.model = None
+        self._owns_model = False
     
     def load_model(self, model_path: Optional[str] = None, model: Optional[torch.nn.Module] = None, device=None):
         """
@@ -42,12 +51,14 @@ class InferenceEngine:
             device: Computing device
         """
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.close()
         
         if model is not None:
             # Use provided model (for validation during training)
             self.model = model
             self.model.to(self.device)
         elif model_path:
+            self._owns_model = True
             # Load model from file (for standalone inference)
             checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
             
@@ -412,9 +423,7 @@ class InferenceEngine:
                     protein2_mask = batch['protein2_mask']
                     labels = batch['label']
                 else:
-                    if self.logger:
-                        self.logger.error(f"Unrecognized batch format, available keys: {list(batch.keys())}")
-                    continue
+                    raise RuntimeError(f"Unrecognized evaluation batch format: {list(batch.keys())}")
                 
                 # Extract protein IDs if available
                 protein_ids = None
@@ -445,9 +454,7 @@ class InferenceEngine:
                     # Ensure model is loaded
                     model_ref = self.model
                     if model_ref is None:
-                        if self.logger:
-                            self.logger.error("Model not loaded")
-                        continue
+                        raise RuntimeError("Evaluation model is not loaded")
                     
                     # 传递protein_ids以支持多模态特征获取
                     if return_features:
@@ -484,13 +491,15 @@ class InferenceEngine:
                         all_predictions.extend(_to_list_safe(predictions.squeeze().cpu().numpy()))
                     
                     if return_features and all_features is not None:
-                        all_features.extend(_to_list_safe(features.squeeze().cpu().numpy()))
+                        all_features.extend(features.reshape(labels.numel(), -1).cpu().tolist())
                     
                     all_labels.extend(_to_list_safe(labels.cpu().numpy()))
                 except Exception as e:
                     if self.logger:
                         self.logger.error(f"模型推理错误: {e}")
-                    continue
+                    if attention_file_handle is not None:
+                        attention_file_handle.close()
+                    raise RuntimeError(f"Inference failed in {dataset_name}; partial results rejected") from e
             
             if show_progress:
                 eval_pbar.close()
@@ -505,6 +514,11 @@ class InferenceEngine:
         # Calculate metrics
         predictions_array = np.array(all_predictions)
         labels_array = np.array(all_labels)
+        if (len(predictions_array) != len(dataset) or len(labels_array) != len(dataset)
+                or len(all_protein_ids) != len(dataset) or len(dataset) == 0):
+            raise RuntimeError(f"Incomplete evaluation coverage for {dataset_name}")
+        if not np.isfinite(predictions_array).all() or not np.isfinite(labels_array).all():
+            raise RuntimeError(f"Nonfinite evaluation values in {dataset_name}")
         
         if return_logits:
             # For logits, convert back to probabilities for metric calculation
@@ -515,9 +529,8 @@ class InferenceEngine:
         try:
             roc_auc = roc_auc_score(labels_array, predictions_for_metrics)
             pr_auc = average_precision_score(labels_array, predictions_for_metrics)
-        except ValueError:
-            roc_auc = 0.0
-            pr_auc = 0.0
+        except ValueError as e:
+            raise RuntimeError(f"Metrics failed for {dataset_name}; zero substitution is forbidden") from e
         
         # Calculate detailed metrics using create_prediction_report
         threshold = self.config.get('inference', {}).get('threshold', 0.5)

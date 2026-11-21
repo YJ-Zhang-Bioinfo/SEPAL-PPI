@@ -16,6 +16,9 @@ data_processing:
   cache_features: true  # 是否缓存特征数据到内存
   normalization_method: "z_score"  # 归一化方法: z_score, min_max
   handle_missing: "zero"  # 缺失值处理: zero, mean, drop
+  use_batched_loading: true  # Set false to load individual feature files instead.
+  required_lmdb_schema: null  # Set to BPP_RSA_Q3_1.0 for validated RSA/Q3 stores.
+  visible_cap: null  # BPP: validate full FASTA lengths unless using a capped prefix.
   # 统一特征根目录：训练时指向 S1，预测时可在命令行用 --predict-prot-feature-folder 覆盖
   all_feature_folder: ${all_feature_folder}  # 从顶层配置引用
   # 预测阶段如果缺失特征，按错误记录但继续回退为0向量

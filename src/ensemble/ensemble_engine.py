@@ -168,7 +168,8 @@ class EnsembleInferenceEngine:
         
         self.logger.info(f"All {len(self.inference_engines)} models loaded")
     
-    def _create_datasets(self, config: Dict) -> Dict:
+    def _create_datasets(self, config: Dict, dataset_names: Optional[List[str]] = None,
+                         exclude_names=()) -> Dict:
         """Create datasets for a given model configuration."""
         data_config = config['data']
         
@@ -192,6 +193,13 @@ class EnsembleInferenceEngine:
                     all_files['val'] = data_config['validation_file']  # use 'val' as key
                 if 'test_file' in data_config:
                     all_files['test'] = data_config['test_file']  # use 'test' as key
+
+            if dataset_names is not None:
+                allowed = set(dataset_names)
+                all_files = {name: path for name, path in all_files.items() if name in allowed}
+            all_files = {name: path for name, path in all_files.items() if path and name not in exclude_names}
+            if not all_files:
+                return {}
             
             if is_cis_data:
                 # use CIS-specific data loader
@@ -199,7 +207,6 @@ class EnsembleInferenceEngine:
                 
                 cis_config = {
                     'embedding_file': data_config['embedding_file'],
-                    'train_file': data_config.get('train_file'),
                     'test_files': {k: v for k, v in all_files.items() if k != 'train'},
                     'batch_size': 32,  # use smaller batch size for inference
                     'cache_size': data_config.get('cache_size', 8000),
@@ -207,6 +214,8 @@ class EnsembleInferenceEngine:
                     'embedding_dim': data_config.get('embedding_dim', config['model'].get('embedding_dim', 1280)),
                     'target_precision': data_config.get('target_precision', 'fp32')
                 }
+                if 'train' in all_files:
+                    cis_config['train_file'] = all_files['train']
                 
                 # if there is a training file, include it in the test_files mapping
                 if 'train' in all_files:
@@ -228,7 +237,6 @@ class EnsembleInferenceEngine:
                 
                 compat_config = {
                     'embedding_file': data_config['embedding_file'],
-                    'train_file': data_config.get('train_file'),
                     'test_files': {k: v for k, v in all_files.items() if k != 'train'},
                     'fasta_file': data_config['fasta_file'],
                     'batch_size': 32,
@@ -240,6 +248,8 @@ class EnsembleInferenceEngine:
                     'target_precision': data_config.get('target_precision'),
                     'cis_type': data_config.get('cis_type', False)
                 }
+                if 'train' in all_files:
+                    compat_config['train_file'] = all_files['train']
                 
                 # 如果有训练文件，添加到test_files中
                 if 'train' in all_files:
@@ -258,7 +268,8 @@ class EnsembleInferenceEngine:
         else:
             raise NotImplementedError("Ensemble inference currently supports sequence data only")
     
-    def collect_logits(self, mode: str = 'logits') -> Dict[str, Dict]:
+    def collect_logits(self, mode: str = 'logits', dataset_names: Optional[List[str]] = None,
+                       exclude_names=()) -> Dict[str, Dict]:
         """
         Collect logits or features from each model.
 
@@ -278,7 +289,7 @@ class EnsembleInferenceEngine:
             self.logger.info(f"Creating dedicated datasets for model {model_name}...")
             
             # create model-specific datasets for each model
-            model_datasets = self._create_datasets(config)
+            model_datasets = self._create_datasets(config, dataset_names=dataset_names, exclude_names=exclude_names)
             
             self.logger.info(f"Model {model_name} datasets: {list(model_datasets.keys())}")
             
@@ -343,30 +354,49 @@ class EnsembleInferenceEngine:
             if not model_data:
                 continue
             
-            # check that all models have the same sample counts
+            missing_models = set(self.model_names) - set(model_data)
+            if missing_models:
+                raise ValueError(
+                    f"Dataset {dataset_name} is missing ensemble model outputs: {sorted(missing_models)}"
+                )
+
+            # Check counts, ordered pairs and labels. Silent truncation can align
+            # different biological pairs and is never safe for ensemble fitting.
             if mode == 'logits':
                 sample_counts = {model_name: len(data['logits']) for model_name, data in model_data.items()}
             else:  # features
                 sample_counts = {model_name: len(data['features']) for model_name, data in model_data.items()}
-            
-            unique_counts = set(sample_counts.values())
-            
-            if len(unique_counts) > 1:
-                self.logger.warning(f"Dataset {dataset_name} has inconsistent sample counts across models: {sample_counts}")
-                # truncate to the smallest length
-                min_count = min(sample_counts.values())
-                self.logger.warning(f"Truncating to minimum length: {min_count}")
-                
-                for model_name, data in model_data.items():
-                    if mode == 'logits':
-                        data['logits'] = data['logits'][:min_count]
-                    else:  # features
-                        data['features'] = data['features'][:min_count]
-                    data['labels'] = data['labels'][:min_count]
-                    if data['protein_ids']:
-                        data['protein_ids'] = data['protein_ids'][:min_count]
-            else:
-                self.logger.info(f"Dataset {dataset_name}: all models have consistent sample counts ({list(unique_counts)[0]} samples)")
+
+            if len(set(sample_counts.values())) != 1:
+                raise ValueError(
+                    f"Dataset {dataset_name} has inconsistent sample counts across models: {sample_counts}"
+                )
+
+            reference_name = self.model_names[0]
+            reference = model_data[reference_name]
+            reference_labels = np.asarray(reference.get('labels', []))
+            reference_pairs = [
+                tuple(item) if isinstance(item, (list, tuple, np.ndarray)) else str(item)
+                for item in reference.get('protein_ids', [])
+            ]
+            if len(reference_labels) != sample_counts[reference_name] or len(reference_pairs) != sample_counts[reference_name]:
+                raise ValueError(f"Dataset {dataset_name} has incomplete labels or pair IDs for {reference_name}")
+
+            for model_name in self.model_names[1:]:
+                current = model_data[model_name]
+                current_labels = np.asarray(current.get('labels', []))
+                current_pairs = [
+                    tuple(item) if isinstance(item, (list, tuple, np.ndarray)) else str(item)
+                    for item in current.get('protein_ids', [])
+                ]
+                if not np.array_equal(reference_labels, current_labels):
+                    raise ValueError(f"Dataset {dataset_name} label order differs for {model_name}")
+                if reference_pairs != current_pairs:
+                    raise ValueError(f"Dataset {dataset_name} ordered protein pairs differ for {model_name}")
+
+            self.logger.info(
+                f"Dataset {dataset_name}: aligned {sample_counts[reference_name]} ordered samples across all models"
+            )
     
     def train_meta_learner(self, train_data: Dict[str, Dict], mode: str = 'logits', model_type: str = 'linear') -> None:
         """
@@ -965,4 +995,4 @@ class EnsembleInferenceEngine:
                 return None
         else:
             self.logger.warning("Unable to obtain validation logits")
-            return None 
+            return None
